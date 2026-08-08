@@ -1,13 +1,3 @@
----
-title: YT-DLP Media Server
-emoji: 📥
-colorFrom: blue
-colorTo: purple
-sdk: docker
-app_port: 7860
-pinned: false
----
-
 # YT-DLP Media Server
 
 A private, self-hosted media link generator, downloader, and streaming library for a Hugging Face Docker Space. Paste any URL supported by [yt-dlp](https://github.com/yt-dlp/yt-dlp), then either extract an instant provider link without storing media or download it for a reliable 30-day signed link.
