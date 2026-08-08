@@ -268,9 +268,28 @@ def get_media_file(job_id: str) -> Path:
 
 
 def public_base_url(request: Request) -> str:
-    # Hugging Face provides SPACE_HOST automatically.
-    if SPACE_HOST:
-        return f"https://{SPACE_HOST}"
+    # A custom-domain proxy can append its host to Hugging Face's host. Use the
+    # final forwarded value instead of emitting an invalid comma-separated URL.
+    configured_host = (
+        SPACE_HOST
+        or request.headers.get("x-forwarded-host", "")
+        or request.headers.get("host", "")
+    )
+    hosts = [host.strip() for host in configured_host.split(",") if host.strip()]
+    if hosts:
+        host = hosts[-1]
+        parsed_host = urlparse(f"//{host}")
+        if (
+            parsed_host.hostname
+            and parsed_host.netloc == host
+            and parsed_host.username is None
+            and parsed_host.password is None
+        ):
+            forwarded_proto = request.headers.get("x-forwarded-proto", "https")
+            scheme = forwarded_proto.split(",")[-1].strip().lower()
+            if scheme not in {"http", "https"}:
+                scheme = "https"
+            return f"{scheme}://{host}"
     return str(request.base_url).rstrip("/")
 
 
@@ -313,11 +332,11 @@ def direct_link_expiration(urls: list[str]) -> int | None:
 
 def instant_format_selector(mode: str) -> str:
     if mode == "best":
-        return "bv*+ba/b"
+        return "b[vcodec!=none][acodec!=none]"
     if mode == "1080":
-        return "bv*[height<=1080]+ba/b[height<=1080]"
+        return "b[height<=1080][vcodec!=none][acodec!=none]"
     if mode == "720":
-        return "bv*[height<=720]+ba/b[height<=720]"
+        return "b[height<=720][vcodec!=none][acodec!=none]"
     if mode == "audio":
         return "ba"
     raise ValueError("MP3 and M4A conversion requires 30-day storage")

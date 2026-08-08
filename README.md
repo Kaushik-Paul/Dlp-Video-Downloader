@@ -82,7 +82,7 @@ Open <http://localhost:7860>. The configured password is entered in the web UI; 
 
 ## Instant links vs 30-day storage
 
-**Instant source link** asks yt-dlp for the provider's current CDN URL and does not download, proxy, or store the media. It is fast and uses no bucket capacity, but the provider controls its lifetime. The link may expire within minutes or hours, may require provider-specific headers or cookies, and high-quality video may be returned as separate video and audio URLs. MP3/M4A conversion is unavailable because conversion requires downloading the media.
+**Instant source link** asks yt-dlp for the provider's best single-file CDN URL containing both video and audio. It does not download, proxy, or store the media. It is fast and uses no bucket capacity, but the provider controls its lifetime and may offer a lower resolution than its separate video/audio streams. The link may expire within minutes or hours or require provider-specific headers or cookies. MP3/M4A conversion is unavailable because conversion requires downloading the media.
 
 **Store for 30 days** downloads and, when needed, merges or converts the media. The resulting signed URL supports browser/VLC/mpv seeking and remains renewable until the fixed 30-day retention deadline.
 
