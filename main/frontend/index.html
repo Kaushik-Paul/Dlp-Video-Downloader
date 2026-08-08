@@ -13,7 +13,7 @@
         <header>
             <div class="logo">📥</div>
             <h1>YT-DLP Media Server</h1>
-            <p class="subtitle">Paste a video URL. Get a streamable, downloadable link.</p>
+            <p class="subtitle">Paste a video URL. Links and stored media expire after 30 days.</p>
         </header>
 
         <div class="card">
@@ -37,7 +37,8 @@
 
         <div class="card" id="result">
             <div class="filename" id="filename"></div>
-            <div class="badges"><span class="badge" id="filesize"></span><span class="badge" id="filemode"></span></div>
+            <div class="badges"><span class="badge" id="filesize"></span><span class="badge" id="filemode"></span><span
+                    class="badge" id="expiry"></span></div>
             <div class="link-row">
                 <h3>Stream URL · VLC / mpv / browser</h3>
                 <div class="linkbox"><input id="streamUrl" readonly><button class="btn-ghost"

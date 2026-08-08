@@ -21,6 +21,7 @@ The server stores completed media in a mounted Hugging Face Storage Bucket. File
 - A persistent media library recovered after Space restarts
 - Password-protected job creation, library browsing, and deletion
 - HMAC-signed media links with configurable expiry
+- Automatic deletion of bucket media 30 days after download
 - HTTP byte-range support for seeking in browsers, VLC, and mpv
 - A self-contained HTML/CSS/JavaScript interface with no CDN dependencies
 
@@ -67,6 +68,8 @@ pip install -r requirements.txt
 export APP_PASSWORD='choose-a-password'
 export SIGNING_SECRET='use-a-different-long-random-secret'
 export MEDIA_DIR='./data/media'
+export LINK_TTL_HOURS=720
+export MEDIA_RETENTION_DAYS=30
 
 uvicorn main.backend.app:app --host 0.0.0.0 --port 7860
 ```
@@ -106,7 +109,8 @@ hf spaces secrets add kaushikpaul/Dlp-Video-Downloader \
   -s SIGNING_SECRET='use-a-different-long-random-secret'
 
 hf spaces variables add kaushikpaul/Dlp-Video-Downloader \
-  -e LINK_TTL_HOURS=168
+  -e LINK_TTL_HOURS=720 \
+  -e MEDIA_RETENTION_DAYS=30
 ```
 
 Deploy the current working tree:
@@ -143,7 +147,8 @@ hf spaces volumes set kaushikpaul/Dlp-Video-Downloader \
 | --- | --- | --- | --- |
 | `APP_PASSWORD` | Yes | empty | Authorizes job creation, library access, and deletion. An empty value intentionally makes protected operations fail. |
 | `SIGNING_SECRET` | Recommended | `APP_PASSWORD` | HMAC key for media URLs. Keep it stable or existing links stop working. |
-| `LINK_TTL_HOURS` | No | `168` | Lifetime of newly generated stream/download links. |
+| `LINK_TTL_HOURS` | No | `720` | Maximum lifetime of newly generated stream/download links. Links never outlive their stored media. |
+| `MEDIA_RETENTION_DAYS` | No | `30` | Permanently delete completed media this many days after download. |
 | `MEDIA_DIR` | No | `/data/media` | Media root. Keep this under the mounted `/data` directory on Spaces. |
 | `SPACE_HOST` | Automatic on HF | request host | Used to create absolute public media URLs. |
 
@@ -158,6 +163,8 @@ hf spaces volumes set kaushikpaul/Dlp-Video-Downloader \
 | `GET or HEAD /media/{id}?expires=...&sig=...&download=0|1` | Stream inline or download using a signed URL. |
 
 Media URLs are bearer links: anyone holding an unexpired URL can read that item. Keep the Space protected, use a strong signing secret, and shorten `LINK_TTL_HOURS` if links may be shared accidentally.
+
+Every completed file has a fixed 30-day retention deadline. New links are capped at that deadline, expired media returns HTTP `410`, and cleanup runs when the app starts and every six hours while it is awake. If the Space is asleep at the deadline, physical bucket deletion happens when the Space next wakes, but the signed link itself is already expired.
 
 ## Validation
 
@@ -180,7 +187,8 @@ The second request should return `206 Partial Content`, `Accept-Ranges: bytes`, 
 ## Operational notes
 
 - Downloads are intentionally serialized with a semaphore to avoid overloading CPU Basic hardware.
-- Restarting the Space interrupts active jobs. Completed jobs remain in the bucket and are recovered from `_meta.json`.
+- Restarting the Space interrupts active jobs. Completed jobs remain in the bucket for 30 days and are recovered from `_meta.json`.
+- Expired media is permanently deleted on startup and every six hours while the Space is running.
 - Deleting an item permanently removes it from the non-versioned bucket.
 - Keep `SIGNING_SECRET` unchanged across deployments so existing links remain valid until expiry.
 - Only download media you are authorized to access and follow the source site's terms and applicable law.
@@ -202,3 +210,9 @@ The image already includes Deno and `yt-dlp[default]` for JavaScript challenges.
 **A format downloads but will not preview in the browser**
 
 VLC or mpv may support containers/codecs that the browser does not. Use the signed stream URL in one of those players, or choose another yt-dlp format.
+
+---
+
+## 📄 License
+
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.

@@ -16,6 +16,11 @@ function formatBytes(bytes) {
     return bytes.toFixed(2) + " " + units[i];
 }
 
+function formatExpiry(timestamp) {
+    if (!timestamp) return "";
+    return "Expires " + new Date(timestamp * 1000).toLocaleString();
+}
+
 function setBusy(busy, message) {
     $("spinner").classList.toggle("on", busy);
     $("goBtn").disabled = busy;
@@ -72,6 +77,7 @@ function showResult(data) {
     $("filename").textContent = data.filename;
     $("filesize").textContent = formatBytes(data.size);
     $("filemode").textContent = (data.mode || "media").toUpperCase();
+    $("expiry").textContent = formatExpiry(data.retention_expires || data.expires);
     $("streamUrl").value = data.stream_url;
     $("downloadUrl").value = data.download_url;
     const name = data.filename.toLowerCase();
@@ -147,9 +153,11 @@ function renderLibrary(items) {
         const row = document.createElement("div");
         row.className = "lib-item";
         const date = item.created ? new Date(item.created * 1000).toLocaleDateString() : "";
+        const expiry = formatExpiry(item.retention_expires || item.expires);
         row.innerHTML =
             '<div class="lib-info"><div class="lib-name"></div>' +
-            '<div class="lib-meta">' + formatBytes(item.size) + (date ? " · " + date : "") + "</div></div>" +
+            '<div class="lib-meta">' + formatBytes(item.size) + (date ? " · Added " + date : "") +
+            (expiry ? " · " + expiry : "") + "</div></div>" +
             '<div class="lib-actions">' +
             '<button class="btn-ghost" data-act="open">Open</button>' +
             '<button class="btn-ghost" data-act="copy">Copy URL</button>' +
