@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>YT-DLP Media Server</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <div class="logo">📥</div>
+            <h1>YT-DLP Media Server</h1>
+            <p class="subtitle">Paste a video URL. Get a streamable, downloadable link.</p>
+        </header>
+
+        <div class="card">
+            <label class="field" for="password">App password</label>
+            <input id="password" type="password" placeholder="Your Space password" autocomplete="current-password">
+            <label class="field" for="url">Video / media URL</label>
+            <input id="url" type="url" placeholder="https://www.youtube.com/watch?v=...">
+            <label class="field">Format</label>
+            <div class="modes">
+                <label class="pill"><input type="radio" name="mode" value="best" checked><span>✨ Best
+                        quality</span></label>
+                <label class="pill"><input type="radio" name="mode" value="1080"><span>🎬 1080p</span></label>
+                <label class="pill"><input type="radio" name="mode" value="720"><span>🎬 720p</span></label>
+                <label class="pill"><input type="radio" name="mode" value="mp3"><span>🎵 MP3</span></label>
+                <label class="pill"><input type="radio" name="mode" value="m4a"><span>🎵 M4A</span></label>
+            </div>
+            <button class="btn-primary" id="goBtn" onclick="createJob()">Generate Media Link</button>
+            <div class="status"><span class="spinner" id="spinner"></span><span id="status"></span></div>
+            <div class="error" id="error"></div>
+        </div>
+
+        <div class="card" id="result">
+            <div class="filename" id="filename"></div>
+            <div class="badges"><span class="badge" id="filesize"></span><span class="badge" id="filemode"></span></div>
+            <div class="link-row">
+                <h3>Stream URL · VLC / mpv / browser</h3>
+                <div class="linkbox"><input id="streamUrl" readonly><button class="btn-ghost"
+                        onclick="copyField('streamUrl')">Copy</button></div>
+            </div>
+            <div class="link-row">
+                <h3>Download URL</h3>
+                <div class="linkbox"><input id="downloadUrl" readonly><button class="btn-ghost"
+                        onclick="copyField('downloadUrl')">Copy</button></div>
+            </div>
+            <video id="videoPlayer" controls style="display:none"></video>
+            <audio id="audioPlayer" controls style="display:none"></audio>
+            <button class="btn-danger" onclick="deleteMedia()">🗑 Delete stored file</button>
+        </div>
+
+        <div class="card">
+            <div class="lib-head">
+                <h2>📚 Library</h2><button class="btn-ghost" onclick="loadLibrary()">Refresh</button>
+            </div>
+            <div id="library">
+                <div class="empty">Enter your password and hit Refresh to load stored media.</div>
+            </div>
+        </div>
+    </div>
+    <div id="toast"></div>
+    <script src="/static/app.js"></script>
+</body>
+
+</html>
