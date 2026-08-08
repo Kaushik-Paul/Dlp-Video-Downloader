@@ -30,6 +30,19 @@ WORKDIR /home/user/app
 # yt-dlp currently recommends Deno for YouTube's JS challenges.
 RUN curl -fsSL https://deno.land/install.sh | sh
 
+# Generate YouTube proof-of-origin tokens without account cookies. The matching
+# Python plugin is installed from requirements.txt below.
+ARG BGUTIL_VERSION=1.3.1
+RUN curl -fsSL \
+        "https://github.com/Brainicism/bgutil-ytdlp-pot-provider/archive/refs/tags/${BGUTIL_VERSION}.tar.gz" \
+        -o /tmp/bgutil-provider.tar.gz && \
+    tar -xzf /tmp/bgutil-provider.tar.gz -C /home/user && \
+    mv "/home/user/bgutil-ytdlp-pot-provider-${BGUTIL_VERSION}" \
+        /home/user/bgutil-ytdlp-pot-provider && \
+    rm /tmp/bgutil-provider.tar.gz && \
+    cd /home/user/bgutil-ytdlp-pot-provider/server && \
+    deno install --allow-scripts=npm:canvas --frozen
+
 COPY --chown=user requirements.txt .
 
 RUN pip install --user --no-cache-dir -r requirements.txt

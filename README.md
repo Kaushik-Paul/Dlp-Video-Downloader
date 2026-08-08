@@ -23,6 +23,7 @@ The server stores completed media in a mounted Hugging Face Storage Bucket. File
 - Password-protected job creation, library browsing, and deletion
 - HMAC-signed media links with configurable expiry
 - Automatic deletion of bucket media 30 days after download
+- Browser-compatible TLS requests and automatic YouTube PO-token generation
 - HTTP byte-range support for seeking in browsers, VLC, and mpv
 - A self-contained HTML/CSS/JavaScript interface with no CDN dependencies
 
@@ -160,6 +161,8 @@ hf spaces volumes set kaushikpaul/Dlp-Video-Downloader \
 | `MEDIA_RETENTION_DAYS` | No | `30` | Permanently delete completed media this many days after download. |
 | `MEDIA_DIR` | No | `/data/media` | Media root. Keep this under the mounted `/data` directory on Spaces. |
 | `SPACE_HOST` | Automatic on HF | request host | Used to create absolute public media URLs. |
+| `YTDLP_PROXY` | No | empty | Authenticated HTTP/SOCKS proxy URL used by yt-dlp. Configure as a Space Secret, not a variable. |
+| `YOUTUBE_COOKIES_B64` | No | empty | Base64-encoded Netscape YouTube cookie file. Decoded to ephemeral `/tmp` with mode `0600`. |
 
 ## API
 
@@ -216,7 +219,27 @@ Confirm `hf spaces volumes ls kaushikpaul/Dlp-Video-Downloader` shows the privat
 
 **YouTube returns `403` or asks to confirm you are not a bot**
 
-The image already includes Deno and `yt-dlp[default]` for JavaScript challenges. Datacenter IPs may still require a yt-dlp PO Token provider; see the official [yt-dlp PO Token guide](https://github.com/yt-dlp/yt-dlp/wiki/Po-Token-Guide).
+The image includes Deno, yt-dlp's browser TLS transport, and the BgUtils PO-token provider configured for the recommended `mweb` client. This avoids storing YouTube account cookies. YouTube can still block heavily shared datacenter IPs, and the provider itself notes that a token cannot guarantee bypassing every bot check. See the official [yt-dlp PO Token guide](https://github.com/yt-dlp/yt-dlp/wiki/Po-Token-Guide).
+
+The safest workaround is a reputable proxy whose address is not blocked by YouTube:
+
+```bash
+hf spaces secrets add kaushikpaul/Dlp-Video-Downloader \
+  -s YTDLP_PROXY='http://USER:PASSWORD@HOST:PORT'
+```
+
+If a proxy is unavailable, export a fresh Netscape-format cookie file from a separate/throwaway YouTube account and configure it without committing or uploading the file:
+
+```bash
+hf spaces secrets add kaushikpaul/Dlp-Video-Downloader \
+  -s YOUTUBE_COOKIES_B64="$(base64 -w0 youtube-cookies.txt)"
+```
+
+Cookie-based extraction carries a risk of YouTube temporarily or permanently banning the account. The official [yt-dlp YouTube extractor guide](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies) recommends an isolated session and warns against using a primary account.
+
+**YouTube fails with `SSL: UNEXPECTED_EOF_WHILE_READING`**
+
+The server uses yt-dlp's supported `curl-cffi` browser transport and forces IPv4 because some Space network routes terminate Python/OpenSSL connections to YouTube unexpectedly. Disabling certificate verification is intentionally avoided: the failure occurs during transport and is not caused by an untrusted certificate.
 
 **A format downloads but will not preview in the browser**
 

@@ -1,3 +1,5 @@
+import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -52,13 +54,31 @@ SIGNING_SECRET = os.getenv("SIGNING_SECRET", APP_PASSWORD)
 LINK_TTL_HOURS = int(os.getenv("LINK_TTL_HOURS", "720"))
 MEDIA_RETENTION_DAYS = int(os.getenv("MEDIA_RETENTION_DAYS", "30"))
 SPACE_HOST = os.getenv("SPACE_HOST")
+YTDLP_PROXY = os.getenv("YTDLP_PROXY", "").strip()
+YOUTUBE_COOKIES_B64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
+YOUTUBE_COOKIES_FILE = Path("/tmp/youtube-cookies.txt")
 
 if LINK_TTL_HOURS <= 0:
     raise RuntimeError("LINK_TTL_HOURS must be greater than zero")
 if MEDIA_RETENTION_DAYS <= 0:
     raise RuntimeError("MEDIA_RETENTION_DAYS must be greater than zero")
+if YTDLP_PROXY and urlparse(YTDLP_PROXY).scheme not in {
+    "http", "https", "socks4", "socks4a", "socks5", "socks5h"
+}:
+    raise RuntimeError("YTDLP_PROXY must be an HTTP or SOCKS proxy URL")
 
 MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
+
+if YOUTUBE_COOKIES_B64:
+    try:
+        encoded_cookies = "".join(YOUTUBE_COOKIES_B64.split())
+        decoded_cookies = base64.b64decode(encoded_cookies, validate=True)
+        if not decoded_cookies or len(decoded_cookies) > 2 * 1024 * 1024:
+            raise ValueError("cookie file is empty or too large")
+        YOUTUBE_COOKIES_FILE.write_bytes(decoded_cookies)
+        YOUTUBE_COOKIES_FILE.chmod(0o600)
+    except (binascii.Error, OSError, ValueError) as exc:
+        raise RuntimeError("YOUTUBE_COOKIES_B64 is not a valid cookie file") from exc
 
 VALID_MODES = {"best", "1080", "720", "audio", "mp3", "m4a"}
 VALID_DELIVERIES = {"stored", "instant"}
@@ -319,12 +339,43 @@ def selected_direct_formats(info: dict) -> list[dict]:
     return [info] if info.get("url") else []
 
 
+def yt_dlp_network_args() -> list[str]:
+    arguments = [
+        "--force-ipv4",
+        "--impersonate",
+        "chrome",
+        "--extractor-args",
+        "youtube:player_client=mweb",
+    ]
+    if YTDLP_PROXY:
+        arguments.extend(("--proxy", YTDLP_PROXY))
+    if YOUTUBE_COOKIES_B64:
+        arguments.extend(("--cookies", str(YOUTUBE_COOKIES_FILE)))
+    return arguments
+
+
+def yt_dlp_error(stderr: str, fallback: str) -> str:
+    error = stderr.strip()
+    if YTDLP_PROXY:
+        error = error.replace(YTDLP_PROXY, "[configured proxy]")
+    if "Sign in to confirm" in error and "not a bot" in error:
+        return (
+            "YouTube blocked this Space's shared datacenter IP even after the "
+            "PO-token attempt. Configure the YTDLP_PROXY Space secret (recommended) "
+            "or YOUTUBE_COOKIES_B64; see README.md."
+        )
+    if len(error) > 4000:
+        error = error[-4000:]
+    return error or fallback
+
+
 def run_instant_link(job_id: str, url: str, mode: str):
     try:
         update_job(job_id, status="extracting", message="Extracting source links...")
         command = [
             "yt-dlp",
             "--no-playlist",
+            *yt_dlp_network_args(),
             "--no-progress",
             "--no-warnings",
             "--skip-download",
@@ -341,10 +392,9 @@ def run_instant_link(job_id: str, url: str, mode: str):
             timeout=120,
         )
         if result.returncode != 0:
-            error = result.stderr.strip()
-            if len(error) > 4000:
-                error = error[-4000:]
-            raise RuntimeError(error or "yt-dlp could not extract a source link")
+            raise RuntimeError(
+                yt_dlp_error(result.stderr, "yt-dlp could not extract a source link")
+            )
 
         try:
             info = json.loads(result.stdout)
@@ -416,6 +466,7 @@ def run_download(job_id: str, url: str, mode: str):
             command = [
                 "yt-dlp",
                 "--no-playlist",
+                *yt_dlp_network_args(),
                 "--no-progress",
                 "-P", str(directory),
                 "-o", "%(title).180B [%(id)s].%(ext)s",
@@ -441,10 +492,7 @@ def run_download(job_id: str, url: str, mode: str):
             result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
             if result.returncode != 0:
-                error = result.stderr.strip()
-                if len(error) > 4000:
-                    error = error[-4000:]
-                raise RuntimeError(error or "yt-dlp failed")
+                raise RuntimeError(yt_dlp_error(result.stderr, "yt-dlp failed"))
 
             candidates = [
                 p for p in directory.iterdir()
