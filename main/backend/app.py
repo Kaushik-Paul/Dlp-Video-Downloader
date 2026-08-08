@@ -33,6 +33,7 @@ SPACE_HOST = os.getenv("SPACE_HOST")
 MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
 
 VALID_MODES = {"best", "1080", "720", "mp3", "m4a"}
+JOB_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 
 # Only run one yt-dlp process at a time on CPU Basic hardware.
 download_semaphore = threading.Semaphore(1)
@@ -79,6 +80,11 @@ def verify_signature(job_id: str, expires: int, signature: str):
 # ---------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------
+def validate_job_id(job_id: str):
+    if not JOB_ID_PATTERN.fullmatch(job_id):
+        raise HTTPException(status_code=404, detail="Job not found")
+
+
 def update_job(job_id: str, **values):
     with jobs_lock:
         jobs.setdefault(job_id, {}).update(values)
@@ -92,6 +98,7 @@ def get_job(job_id: str):
 
 
 def job_directory(job_id: str) -> Path:
+    validate_job_id(job_id)
     return MEDIA_ROOT / job_id
 
 
@@ -104,8 +111,17 @@ def load_metadata(job_id: str):
     if not meta_file.exists():
         return None
     try:
-        return json.loads(meta_file.read_text())
-    except Exception:
+        metadata = json.loads(meta_file.read_text(encoding="utf-8"))
+        filename = metadata["filename"]
+        if (
+            not isinstance(filename, str)
+            or not filename
+            or Path(filename).name != filename
+            or metadata.get("job_id") != job_id
+        ):
+            return None
+        return metadata
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None
 
 
@@ -114,7 +130,7 @@ def get_media_file(job_id: str) -> Path:
     if not meta:
         raise HTTPException(status_code=404, detail="Media not found")
     file_path = job_directory(job_id) / meta["filename"]
-    if not file_path.exists():
+    if not file_path.is_file():
         raise HTTPException(status_code=404, detail="Media file no longer exists")
     return file_path
 
@@ -199,7 +215,10 @@ def run_download(job_id: str, url: str, mode: str):
                 "mode": mode,
                 "created": int(time.time()),
             }
-            metadata_path(job_id).write_text(json.dumps(metadata, indent=2, ensure_ascii=False))
+            metadata_path(job_id).write_text(
+                json.dumps(metadata, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
 
             update_job(job_id, status="ready", message="Ready", filename=media_file.name, size=metadata["size"])
 
@@ -231,6 +250,7 @@ def create_job(body: CreateJobRequest):
 
 @app.get("/api/jobs/{job_id}")
 def job_status(job_id: str, request: Request):
+    validate_job_id(job_id)
     job = get_job(job_id)
 
     # If the Space restarted, recover finished jobs from the bucket.
@@ -256,6 +276,7 @@ def job_status(job_id: str, request: Request):
 @app.post("/api/jobs/{job_id}/delete")
 def delete_job(job_id: str, body: PasswordRequest):
     verify_password(body.password)
+    validate_job_id(job_id)
     directory = job_directory(job_id)
     if directory.exists():
         shutil.rmtree(directory)
@@ -270,7 +291,7 @@ def library(body: PasswordRequest, request: Request):
     items = []
     if MEDIA_ROOT.exists():
         for child in MEDIA_ROOT.iterdir():
-            if not child.is_dir():
+            if not child.is_dir() or not JOB_ID_PATTERN.fullmatch(child.name):
                 continue
             meta = load_metadata(child.name)
             if not meta:
@@ -324,8 +345,8 @@ def serve_media(job_id: str, request: Request, expires: int, sig: str, download:
             return Response(status_code=200, media_type=mime_type, headers=headers)
         return StreamingResponse(file_iterator(path, 0, file_size - 1), status_code=200, media_type=mime_type, headers=headers)
 
-    match = re.match(r"bytes=(\d*)-(\d*)$", range_header)
-    if not match:
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header)
+    if not match or not any(match.groups()):
         return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
 
     start_string, end_string = match.group(1), match.group(2)
