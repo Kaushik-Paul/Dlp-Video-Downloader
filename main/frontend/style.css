@@ -101,6 +101,57 @@ input:focus {
     gap: 8px
 }
 
+.delivery-options {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px
+}
+
+.delivery-card input {
+    position: absolute;
+    opacity: 0;
+    pointer-events: none
+}
+
+.delivery-card span {
+    display: flex;
+    min-height: 92px;
+    flex-direction: column;
+    gap: 5px;
+    padding: 14px;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background: rgba(0, 0, 0, .3);
+    cursor: pointer;
+    transition: border-color .15s, background .15s
+}
+
+.delivery-card strong {
+    font-size: 13px
+}
+
+.delivery-card small,
+.mode-note,
+.result-note {
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.45
+}
+
+.delivery-card input:checked+span {
+    border-color: var(--a1);
+    background: rgba(99, 102, 241, .13)
+}
+
+.mode-note {
+    margin-top: 10px
+}
+
+.pill input:disabled+span {
+    opacity: .4;
+    cursor: not-allowed
+}
+
 .pill input {
     display: none
 }
@@ -209,6 +260,14 @@ input:focus {
     gap: 8px;
     margin-top: 9px;
     flex-wrap: wrap
+}
+
+.result-note {
+    margin-top: 13px;
+    padding: 11px 13px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: rgba(0, 0, 0, .22)
 }
 
 .badge {
@@ -359,6 +418,17 @@ audio {
     pointer-events: none;
     transition: all .25s;
     z-index: 10
+}
+
+@media (max-width: 560px) {
+    .delivery-options {
+        grid-template-columns: 1fr
+    }
+
+    .lib-item {
+        align-items: flex-start;
+        flex-direction: column
+    }
 }
 
 #toast.show {
