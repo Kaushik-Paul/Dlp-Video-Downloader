@@ -10,13 +10,14 @@ pinned: false
 
 # YT-DLP Media Server
 
-A private, self-hosted media downloader and streaming library for a Hugging Face Docker Space. Paste any URL supported by [yt-dlp](https://github.com/yt-dlp/yt-dlp), choose a format, and receive signed stream and download links.
+A private, self-hosted media link generator, downloader, and streaming library for a Hugging Face Docker Space. Paste any URL supported by [yt-dlp](https://github.com/yt-dlp/yt-dlp), then either extract an instant provider link without storing media or download it for a reliable 30-day signed link.
 
 The server stores completed media in a mounted Hugging Face Storage Bucket. Files therefore survive Space restarts, while the Space itself can continue using the free CPU Basic runtime.
 
 ## What it provides
 
-- Best quality, 1080p, 720p, MP3, and M4A download modes
+- Best quality, 1080p, 720p, source-audio, MP3, and M4A modes
+- Instant source links that do not download or use bucket storage
 - A background job queue with one active download at a time
 - A persistent media library recovered after Space restarts
 - Password-protected job creation, library browsing, and deletion
@@ -29,9 +30,11 @@ The server stores completed media in a mounted Hugging Face Storage Bucket. File
 
 ```text
 Browser
-  |  POST /api/jobs, GET /api/jobs/{id}
+  |  POST /api/jobs {delivery: instant|stored}, GET /api/jobs/{id}
   v
-FastAPI + yt-dlp + FFmpeg  ---- writes ---->  /data/media/{job_id}
+FastAPI + yt-dlp + FFmpeg  ---- stored mode ---->  /data/media/{job_id}
+  |
+  +---- instant mode ----> Provider CDN URL (not stored)
   |                                             |
   |  signed GET/HEAD /media/{id}                v
   +------------------------------------>  HF Storage Bucket
@@ -75,6 +78,12 @@ uvicorn main.backend.app:app --host 0.0.0.0 --port 7860
 ```
 
 Open <http://localhost:7860>. The configured password is entered in the web UI; it is not stored by the server or written into downloaded metadata.
+
+## Instant links vs 30-day storage
+
+**Instant source link** asks yt-dlp for the provider's current CDN URL and does not download, proxy, or store the media. It is fast and uses no bucket capacity, but the provider controls its lifetime. The link may expire within minutes or hours, may require provider-specific headers or cookies, and high-quality video may be returned as separate video and audio URLs. MP3/M4A conversion is unavailable because conversion requires downloading the media.
+
+**Store for 30 days** downloads and, when needed, merges or converts the media. The resulting signed URL supports browser/VLC/mpv seeking and remains renewable until the fixed 30-day retention deadline.
 
 ## First Hugging Face deployment
 
@@ -156,13 +165,15 @@ hf spaces volumes set kaushikpaul/Dlp-Video-Downloader \
 
 | Endpoint | Purpose |
 | --- | --- |
-| `POST /api/jobs` | Create a job with `{url, mode, password}`. |
+| `POST /api/jobs` | Create a job with `{url, mode, delivery, password}`; `delivery` is `instant` or `stored`. |
 | `GET /api/jobs/{id}` | Poll queued/downloading/ready/error status. |
 | `POST /api/library` | List persisted media with `{password}`. |
 | `POST /api/jobs/{id}/delete` | Delete a persisted item with `{password}`. |
 | `GET or HEAD /media/{id}?expires=...&sig=...&download=0|1` | Stream inline or download using a signed URL. |
 
 Media URLs are bearer links: anyone holding an unexpired URL can read that item. Keep the Space protected, use a strong signing secret, and shorten `LINK_TTL_HOURS` if links may be shared accidentally.
+
+Instant results return provider bearer URLs directly. They are held only in memory until the Space restarts, are never added to the library, and are not governed by `LINK_TTL_HOURS` or `MEDIA_RETENTION_DAYS`.
 
 Every completed file has a fixed 30-day retention deadline. New links are capped at that deadline, expired media returns HTTP `410`, and cleanup runs when the app starts and every six hours while it is awake. If the Space is asleep at the deadline, physical bucket deletion happens when the Space next wakes, but the signed link itself is already expired.
 

@@ -12,7 +12,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
@@ -60,7 +60,8 @@ if MEDIA_RETENTION_DAYS <= 0:
 
 MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
 
-VALID_MODES = {"best", "1080", "720", "mp3", "m4a"}
+VALID_MODES = {"best", "1080", "720", "audio", "mp3", "m4a"}
+VALID_DELIVERIES = {"stored", "instant"}
 JOB_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 CLEANUP_INTERVAL_SECONDS = 6 * 3600
 
@@ -76,6 +77,7 @@ jobs_lock = threading.Lock()
 class CreateJobRequest(BaseModel):
     url: str
     mode: str = "best"
+    delivery: str = "stored"
     password: str
 
 
@@ -267,6 +269,140 @@ def create_media_links(job_id: str, request: Request):
     }
 
 
+def direct_link_expiration(urls: list[str]) -> int | None:
+    """Return the earliest plausible Unix expiry embedded in provider URLs."""
+    now = int(time.time())
+    expirations = []
+    for url in urls:
+        try:
+            query = parse_qs(urlparse(url).query)
+        except ValueError:
+            continue
+        for key in ("expire", "expires", "exp"):
+            for value in query.get(key, []):
+                try:
+                    expiration = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if expiration > 10_000_000_000:
+                    expiration //= 1000
+                if now < expiration < now + 10 * 365 * 86400:
+                    expirations.append(expiration)
+    return min(expirations) if expirations else None
+
+
+def instant_format_selector(mode: str) -> str:
+    if mode == "best":
+        return "bv*+ba/b"
+    if mode == "1080":
+        return "bv*[height<=1080]+ba/b[height<=1080]"
+    if mode == "720":
+        return "bv*[height<=720]+ba/b[height<=720]"
+    if mode == "audio":
+        return "ba"
+    raise ValueError("MP3 and M4A conversion requires 30-day storage")
+
+
+def selected_direct_formats(info: dict) -> list[dict]:
+    selected = info.get("requested_downloads")
+    if isinstance(selected, list) and selected:
+        formats = [item for item in selected if isinstance(item, dict) and item.get("url")]
+        if formats:
+            return formats
+
+    requested = info.get("requested_formats")
+    if isinstance(requested, list) and requested:
+        formats = [item for item in requested if isinstance(item, dict) and item.get("url")]
+        if formats:
+            return formats
+
+    return [info] if info.get("url") else []
+
+
+def run_instant_link(job_id: str, url: str, mode: str):
+    try:
+        update_job(job_id, status="extracting", message="Extracting source links...")
+        command = [
+            "yt-dlp",
+            "--no-playlist",
+            "--no-progress",
+            "--no-warnings",
+            "--skip-download",
+            "--dump-single-json",
+            "-f",
+            instant_format_selector(mode),
+            url,
+        ]
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            error = result.stderr.strip()
+            if len(error) > 4000:
+                error = error[-4000:]
+            raise RuntimeError(error or "yt-dlp could not extract a source link")
+
+        try:
+            info = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("yt-dlp returned invalid link metadata") from exc
+
+        formats = selected_direct_formats(info)
+        if not formats:
+            raise RuntimeError("The provider did not return a directly playable URL")
+
+        combined_url = None
+        video_url = None
+        audio_url = None
+        for selected in formats:
+            selected_url = selected["url"]
+            has_video = selected.get("vcodec") not in (None, "none")
+            has_audio = selected.get("acodec") not in (None, "none")
+            if has_video and has_audio and combined_url is None:
+                combined_url = selected_url
+            elif has_video and video_url is None:
+                video_url = selected_url
+            elif has_audio and audio_url is None:
+                audio_url = selected_url
+
+        primary_url = combined_url or video_url or audio_url or formats[0]["url"]
+        urls = [item["url"] for item in formats]
+        sizes = [
+            item.get("filesize") or item.get("filesize_approx")
+            for item in formats
+        ]
+        known_sizes = [size for size in sizes if isinstance(size, (int, float))]
+        title = info.get("title") or "Source media"
+        extension = info.get("ext") or formats[0].get("ext") or "media"
+        filename = info.get("_filename") or f"{title}.{extension}"
+        headers_required = any(bool(item.get("http_headers")) for item in formats)
+
+        update_job(
+            job_id,
+            status="ready",
+            message="Source links ready",
+            delivery="instant",
+            stored=False,
+            filename=filename,
+            size=int(sum(known_sizes)) if known_sizes else 0,
+            stream_url=primary_url,
+            download_url=primary_url,
+            video_url=video_url,
+            audio_url=audio_url,
+            separate_streams=bool(video_url and audio_url and not combined_url),
+            source_expires=direct_link_expiration(urls),
+            provider_headers_required=headers_required,
+        )
+    except subprocess.TimeoutExpired:
+        update_job(job_id, status="error", message="Source link extraction timed out")
+    except Exception as exc:
+        update_job(job_id, status="error", message=str(exc))
+
+
 # ---------------------------------------------------------------------
 # yt-dlp worker
 # ---------------------------------------------------------------------
@@ -291,6 +427,8 @@ def run_download(job_id: str, url: str, mode: str):
                 command += ["-f", "bv*[height<=1080]+ba/b[height<=1080]"]
             elif mode == "720":
                 command += ["-f", "bv*[height<=720]+ba/b[height<=720]"]
+            elif mode == "audio":
+                command += ["-f", "ba"]
             elif mode == "mp3":
                 command += ["-x", "--audio-format", "mp3", "--audio-quality", "0"]
             elif mode == "m4a":
@@ -358,11 +496,27 @@ def create_job(body: CreateJobRequest):
         raise HTTPException(status_code=400, detail="Enter a valid http:// or https:// URL")
     if body.mode not in VALID_MODES:
         raise HTTPException(status_code=400, detail="Invalid download mode")
+    if body.delivery not in VALID_DELIVERIES:
+        raise HTTPException(status_code=400, detail="Invalid delivery mode")
+    if body.delivery == "instant" and body.mode in {"mp3", "m4a"}:
+        raise HTTPException(
+            status_code=400,
+            detail="MP3 and M4A conversion requires 30-day storage",
+        )
 
     job_id = uuid.uuid4().hex
-    update_job(job_id, status="queued", message="Queued", source_url=body.url, mode=body.mode, created=int(time.time()))
+    update_job(
+        job_id,
+        status="queued",
+        message="Queued",
+        source_url=body.url,
+        mode=body.mode,
+        delivery=body.delivery,
+        created=int(time.time()),
+    )
 
-    thread = threading.Thread(target=run_download, args=(job_id, body.url, body.mode), daemon=True)
+    worker = run_instant_link if body.delivery == "instant" else run_download
+    thread = threading.Thread(target=worker, args=(job_id, body.url, body.mode), daemon=True)
     thread.start()
 
     return {"job_id": job_id, "status": "queued"}
@@ -394,7 +548,7 @@ def job_status(job_id: str, request: Request):
         raise HTTPException(status_code=404, detail="Job not found")
 
     result = {"job_id": job_id, **job}
-    if job.get("status") == "ready":
+    if job.get("status") == "ready" and job.get("delivery") != "instant":
         result.update(create_media_links(job_id, request))
     return result
 

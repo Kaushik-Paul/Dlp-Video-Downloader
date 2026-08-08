@@ -21,6 +21,22 @@ function formatExpiry(timestamp) {
     return "Expires " + new Date(timestamp * 1000).toLocaleString();
 }
 
+function selectedDelivery() {
+    return document.querySelector('input[name="delivery"]:checked').value;
+}
+
+function updateDeliveryOptions() {
+    const instant = selectedDelivery() === "instant";
+    const conversionModes = document.querySelectorAll('input[name="mode"][value="mp3"], input[name="mode"][value="m4a"]');
+    for (const input of conversionModes) input.disabled = instant;
+    const selectedMode = document.querySelector('input[name="mode"]:checked');
+    if (instant && selectedMode.disabled) {
+        document.querySelector('input[name="mode"][value="audio"]').checked = true;
+    }
+    $("modeNote").style.display = instant ? "block" : "none";
+    $("goBtn").textContent = instant ? "Generate Instant Link" : "Download and Store Media";
+}
+
 function setBusy(busy, message) {
     $("spinner").classList.toggle("on", busy);
     $("goBtn").disabled = busy;
@@ -31,6 +47,7 @@ async function createJob() {
     const password = $("password").value;
     const url = $("url").value.trim();
     const mode = document.querySelector('input[name="mode"]:checked').value;
+    const delivery = selectedDelivery();
     sessionStorage.setItem("app_password", password);
     $("error").textContent = "";
     $("result").style.display = "none";
@@ -39,7 +56,7 @@ async function createJob() {
         const response = await fetch("/api/jobs", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ password, url, mode })
+            body: JSON.stringify({ password, url, mode, delivery })
         });
         const data = await response.json();
         if (!response.ok) throw new Error(data.detail || "Request failed");
@@ -58,7 +75,7 @@ async function pollJob() {
         const data = await response.json();
         if (!response.ok) throw new Error(data.detail || "Status request failed");
         setBusy(true, data.message || data.status);
-        if (data.status === "queued" || data.status === "downloading") {
+        if (data.status === "queued" || data.status === "downloading" || data.status === "extracting") {
             setTimeout(pollJob, 2000);
             return;
         }
@@ -76,10 +93,26 @@ function showResult(data) {
     $("result").style.display = "block";
     $("filename").textContent = data.filename;
     $("filesize").textContent = formatBytes(data.size);
+    $("filesize").style.display = data.size ? "inline-block" : "none";
     $("filemode").textContent = (data.mode || "media").toUpperCase();
-    $("expiry").textContent = formatExpiry(data.retention_expires || data.expires);
+    const instant = data.delivery === "instant" || data.stored === false;
+    $("expiry").textContent = instant
+        ? (data.source_expires ? formatExpiry(data.source_expires) : "Provider expiry unknown")
+        : formatExpiry(data.retention_expires || data.expires);
     $("streamUrl").value = data.stream_url;
     $("downloadUrl").value = data.download_url;
+    $("audioUrl").value = data.audio_url || "";
+    $("audioLinkRow").style.display = instant && data.separate_streams && data.audio_url ? "block" : "none";
+    $("downloadRow").style.display = instant ? "none" : "block";
+    $("deleteBtn").style.display = instant ? "none" : "inline-block";
+    $("streamHeading").textContent = instant
+        ? (data.separate_streams ? "Source video URL (video only)" : "Direct source media URL")
+        : "Stream URL · VLC / mpv / browser";
+    $("resultNote").textContent = instant
+        ? (data.separate_streams
+            ? "The provider returned separate video and audio streams. These are not stored or merged, and may expire or require provider headers/cookies."
+            : "This provider URL is not stored in the bucket. It may expire at any time or require provider headers/cookies.")
+        : "Stored in the bucket until the displayed retention deadline.";
     const name = data.filename.toLowerCase();
     const video = $("videoPlayer");
     const audio = $("audioPlayer");
@@ -87,7 +120,10 @@ function showResult(data) {
     audio.style.display = "none";
     video.removeAttribute("src");
     audio.removeAttribute("src");
-    if (/\.(mp4|webm|mkv|mov)$/.test(name)) {
+    if (data.mode === "audio") {
+        audio.src = data.stream_url;
+        audio.style.display = "block";
+    } else if (/\.(mp4|webm|mkv|mov)$/.test(name)) {
         video.src = data.stream_url;
         video.style.display = "block";
     } else if (/\.(mp3|m4a|opus|ogg|wav|flac)$/.test(name)) {
@@ -173,6 +209,10 @@ function renderLibrary(items) {
 }
 
 window.addEventListener("DOMContentLoaded", () => {
+    for (const input of document.querySelectorAll('input[name="delivery"]')) {
+        input.addEventListener("change", updateDeliveryOptions);
+    }
+    updateDeliveryOptions();
     const saved = sessionStorage.getItem("app_password");
     if (saved) { $("password").value = saved; loadLibrary(); }
 });

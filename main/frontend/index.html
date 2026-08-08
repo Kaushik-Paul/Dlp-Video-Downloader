@@ -13,7 +13,7 @@
         <header>
             <div class="logo">📥</div>
             <h1>YT-DLP Media Server</h1>
-            <p class="subtitle">Paste a video URL. Links and stored media expire after 30 days.</p>
+            <p class="subtitle">Get an instant provider link, or store media for a reliable 30-day link.</p>
         </header>
 
         <div class="card">
@@ -21,15 +21,22 @@
             <input id="password" type="password" placeholder="Your Space password" autocomplete="current-password">
             <label class="field" for="url">Video / media URL</label>
             <input id="url" type="url" placeholder="https://www.youtube.com/watch?v=...">
+            <label class="field">Delivery</label>
+            <div class="delivery-options">
+                <label class="delivery-card"><input type="radio" name="delivery" value="instant" checked><span><strong>⚡ Instant source link</strong><small>No bucket storage. Provider-controlled and may expire quickly.</small></span></label>
+                <label class="delivery-card"><input type="radio" name="delivery" value="stored"><span><strong>📦 Store for 30 days</strong><small>Downloads to the bucket, with stable signed links.</small></span></label>
+            </div>
             <label class="field">Format</label>
             <div class="modes">
                 <label class="pill"><input type="radio" name="mode" value="best" checked><span>✨ Best
                         quality</span></label>
                 <label class="pill"><input type="radio" name="mode" value="1080"><span>🎬 1080p</span></label>
                 <label class="pill"><input type="radio" name="mode" value="720"><span>🎬 720p</span></label>
+                <label class="pill"><input type="radio" name="mode" value="audio"><span>🎧 Source audio</span></label>
                 <label class="pill"><input type="radio" name="mode" value="mp3"><span>🎵 MP3</span></label>
                 <label class="pill"><input type="radio" name="mode" value="m4a"><span>🎵 M4A</span></label>
             </div>
+            <div class="mode-note" id="modeNote">Instant mode does not convert media. MP3 and M4A require 30-day storage.</div>
             <button class="btn-primary" id="goBtn" onclick="createJob()">Generate Media Link</button>
             <div class="status"><span class="spinner" id="spinner"></span><span id="status"></span></div>
             <div class="error" id="error"></div>
@@ -39,19 +46,25 @@
             <div class="filename" id="filename"></div>
             <div class="badges"><span class="badge" id="filesize"></span><span class="badge" id="filemode"></span><span
                     class="badge" id="expiry"></span></div>
-            <div class="link-row">
-                <h3>Stream URL · VLC / mpv / browser</h3>
+            <div class="result-note" id="resultNote"></div>
+            <div class="link-row" id="streamRow">
+                <h3 id="streamHeading">Stream URL · VLC / mpv / browser</h3>
                 <div class="linkbox"><input id="streamUrl" readonly><button class="btn-ghost"
                         onclick="copyField('streamUrl')">Copy</button></div>
             </div>
-            <div class="link-row">
+            <div class="link-row" id="audioLinkRow" style="display:none">
+                <h3>Separate source audio URL</h3>
+                <div class="linkbox"><input id="audioUrl" readonly><button class="btn-ghost"
+                        onclick="copyField('audioUrl')">Copy</button></div>
+            </div>
+            <div class="link-row" id="downloadRow">
                 <h3>Download URL</h3>
                 <div class="linkbox"><input id="downloadUrl" readonly><button class="btn-ghost"
                         onclick="copyField('downloadUrl')">Copy</button></div>
             </div>
             <video id="videoPlayer" controls style="display:none"></video>
             <audio id="audioPlayer" controls style="display:none"></audio>
-            <button class="btn-danger" onclick="deleteMedia()">🗑 Delete stored file</button>
+            <button class="btn-danger" id="deleteBtn" onclick="deleteMedia()">🗑 Delete stored file</button>
         </div>
 
         <div class="card">
