@@ -106,12 +106,10 @@ function showResult(data) {
     $("downloadRow").style.display = instant ? "none" : "block";
     $("deleteBtn").style.display = instant ? "none" : "inline-block";
     $("streamHeading").textContent = instant
-        ? (data.separate_streams ? "Source video URL (video only)" : "Direct source media URL")
+        ? "Direct source media URL"
         : "Stream URL · VLC / mpv / browser";
     $("resultNote").textContent = instant
-        ? (data.separate_streams
-            ? "The provider returned separate video and audio streams. These are not stored or merged, and may expire or require provider headers/cookies."
-            : "This provider URL is not stored in the bucket. It may expire at any time or require provider headers/cookies.")
+        ? "This single-file provider URL is not stored in the bucket. It may expire at any time or require provider headers/cookies."
         : "Stored in the bucket until the displayed retention deadline.";
     const name = data.filename.toLowerCase();
     const video = $("videoPlayer");
