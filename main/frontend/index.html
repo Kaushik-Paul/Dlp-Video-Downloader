@@ -21,6 +21,18 @@
         <div class="card">
             <label class="field" for="password">App password</label>
             <input id="password" type="password" placeholder="Your Space password" autocomplete="current-password">
+            <label class="field" for="localFile">Upload a local file</label>
+            <input id="localFile" type="file">
+            <div class="upload-actions">
+                <button class="btn-primary" id="uploadBtn" onclick="uploadLocalFile()">Upload File</button>
+                <button class="btn-ghost" id="cancelUploadBtn" onclick="cancelUpload()" style="display:none">Cancel</button>
+            </div>
+            <div class="upload-progress" id="uploadProgress" style="display:none">
+                <div id="uploadProgressBar"></div>
+            </div>
+            <div class="status"><span class="spinner" id="uploadSpinner"></span><span id="uploadStatus"></span></div>
+            <div class="error" id="uploadError"></div>
+            <div class="section-divider"><span>or fetch from a URL</span></div>
             <label class="field" for="url">Video / media URL</label>
             <input id="url" type="url" placeholder="https://www.youtube.com/watch?v=...">
             <label class="field">Delivery</label>
@@ -42,6 +54,8 @@
             <button class="btn-primary" id="goBtn" onclick="createJob()">Generate Media Link</button>
             <div class="status"><span class="spinner" id="spinner"></span><span id="status"></span></div>
             <div class="error" id="error"></div>
+            <button class="btn-danger btn-stop" id="cancelAllBtn" onclick="cancelAllTransfers()">Stop All Transfers</button>
+            <div class="stop-note">Stops active and queued uploads or URL downloads. Existing streams keep playing.</div>
         </div>
 
         <div class="card" id="result">
@@ -66,6 +80,7 @@
             </div>
             <video id="videoPlayer" controls style="display:none"></video>
             <audio id="audioPlayer" controls style="display:none"></audio>
+            <button class="btn-primary btn-download" id="fastDownloadBtn" onclick="fastDownloadCurrent()">Fast Download</button>
             <button class="btn-danger" id="deleteBtn" onclick="deleteMedia()">🗑 Delete stored file</button>
         </div>
 

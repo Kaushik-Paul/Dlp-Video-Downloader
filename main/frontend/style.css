@@ -79,7 +79,8 @@ label.field:first-child {
 
 input[type=password],
 input[type=url],
-input[type=text] {
+input[type=text],
+input[type=file] {
     width: 100%;
     padding: 12px 14px;
     border-radius: 10px;
@@ -89,6 +90,73 @@ input[type=text] {
     font-size: 14px;
     outline: none;
     transition: border-color .15s
+}
+
+input[type=file] {
+    padding: 8px;
+    color: var(--muted)
+}
+
+input[type=file]::file-selector-button {
+    padding: 8px 12px;
+    margin-right: 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, .08);
+    color: var(--text);
+    cursor: pointer
+}
+
+.upload-actions {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 8px;
+    align-items: stretch
+}
+
+.upload-actions .btn-primary {
+    margin-top: 12px
+}
+
+.upload-actions .btn-ghost {
+    margin-top: 12px;
+    padding: 0 20px
+}
+
+.upload-progress {
+    height: 7px;
+    margin-top: 14px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, .08)
+}
+
+.upload-progress div {
+    width: 0;
+    height: 100%;
+    border-radius: inherit;
+    background: linear-gradient(90deg, var(--a1), var(--a2));
+    transition: width .15s linear
+}
+
+.section-divider {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 22px 0 2px;
+    color: var(--muted);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .08em;
+    text-transform: uppercase
+}
+
+.section-divider::before,
+.section-divider::after {
+    content: "";
+    flex: 1;
+    height: 1px;
+    background: var(--border)
 }
 
 input:focus {
@@ -344,6 +412,26 @@ audio {
     background: rgba(248, 113, 113, .2)
 }
 
+.btn-stop {
+    width: 100%;
+    margin-top: 12px
+}
+
+.stop-note {
+    margin-top: 7px;
+    color: var(--muted);
+    font-size: 11px;
+    text-align: center
+}
+
+.btn-download {
+    margin-top: 20px
+}
+
+.btn-download+.btn-danger {
+    margin-top: 10px
+}
+
 .lib-head {
     display: flex;
     justify-content: space-between;
@@ -386,6 +474,8 @@ audio {
 
 .lib-actions {
     display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
     gap: 6px;
     flex-shrink: 0
 }
