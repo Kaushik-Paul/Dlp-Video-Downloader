@@ -13,6 +13,9 @@ and a delivery mode, and gets either:
 - **Store for 30 days** — the media is downloaded into the mounted HF Storage Bucket
   (`/data`) and served through FastAPI with signed URLs and HTTP Range support so
   players can seek.
+- **Upload local file** — the browser sends bounded parallel raw chunks, which are
+  written directly to their final offsets in one open bucket file. Completed uploads
+  use the same metadata, retention, library, and signed-link path as stored downloads.
 
 ## Repository layout
 
@@ -40,6 +43,10 @@ and a delivery mode, and gets either:
 ```text
 Browser UI (/static/*, /)
     → POST /api/jobs            (password; delivery: "instant" | "stored")
+    → POST /api/uploads         (create parallel local-file upload)
+    → PUT  /api/uploads/{id}/chunks/{index}
+    → POST /api/uploads/{id}/complete|abort
+    → POST /api/transfers/cancel (cancel all ingestion; site protection, no app password)
     → GET  /api/jobs/{id}       (polled until ready/error)
     → POST /api/library         (lists bucket contents, triggers retention cleanup)
     → POST /api/jobs/{id}/delete
@@ -74,6 +81,10 @@ Browser UI (/static/*, /)
 | `LINK_TTL_HOURS` | no | `720` | Max lifetime of new signed links (capped by retention deadline). Must be > 0. |
 | `MEDIA_RETENTION_DAYS` | no | `30` | Stored media deleted this many days after download. Must be > 0. |
 | `MEDIA_DIR` | no | `/data/media` | Download root (bucket mount on HF). |
+| `UPLOAD_MAX_GIB` | no | `20` | Maximum local-file upload size. Must be > 0. |
+| `UPLOAD_CHUNK_MIB` | no | `32` | Raw upload request size. Must be 5-128 MiB. |
+| `UPLOAD_CONCURRENCY` | no | `6` | Parallel browser upload requests. Must be 1-12. |
+| `DOWNLOAD_FRAGMENT_CONCURRENCY` | no | `4` | yt-dlp HLS/DASH fragment concurrency. Must be 1-8. |
 | `SPACE_HOST` | auto on HF | — | Used to build absolute public URLs. |
 | `YTDLP_PROXY` | no | `""` | HTTP/SOCKS proxy for yt-dlp (`http/https/socks4/socks4a/socks5/socks5h`). Validated at startup. Keep as an HF secret. |
 | `YOUTUBE_COOKIES_B64` | no | `""` | Base64 Netscape cookie file; decoded to ephemeral `/tmp/youtube-cookies.txt` (mode 0600). |
@@ -115,13 +126,21 @@ There is no test suite yet; verify manually via the UI and `curl` against the AP
 - Sanitize errors with `yt_dlp_error()`: it redacts the configured proxy from
   stderr and maps "Sign in to confirm you're not a bot" to user-facing guidance.
   Never surface raw stderr to clients any other way.
-- All mutating endpoints must call `verify_password()`.
+- All mutating endpoints must call `verify_password()`, except
+  `POST /api/transfers/cancel`: it intentionally relies on site-level protection and
+  can only stop active/queued ingestion transfers.
 - Job state changes go through `update_job()` / `get_job()` (lock-protected).
   Job IDs are `uuid4().hex` and must match `JOB_ID_PATTERN` (`^[0-9a-f]{32}$`).
 - Anything written to disk belongs under `MEDIA_ROOT / job_id`; `_meta.json` is the
   source of truth for filename/size/mode/retention. Filenames are user-influenced
   (video titles), so always serve via the stored metadata path, never via
   URL-supplied paths; `load_metadata()` rejects anything inconsistent.
+- Upload chunks are raw request bodies, not `multipart/form-data`. Keep writes bounded,
+  offset-based, and idempotent so chunks can run in parallel and retry safely. Never
+  create one persistent bucket file per chunk or buffer a complete upload in memory.
+- Transfer subprocesses must be created through `run_transfer_process()` so global
+  cancellation terminates the complete yt-dlp/FFmpeg process group. Never register
+  `/media/...` responses as transfers; cancellation must not interrupt streaming.
 - Keep the existing section-banner comment style (`# -----...-----`).
 
 **Frontend (`main/frontend/`)**
@@ -130,6 +149,8 @@ There is no test suite yet; verify manually via the UI and `curl` against the AP
 - Theme via CSS custom properties in `:root` (`--a1`, `--a2` are the accent gradient).
 - All API calls live in `app.js`; keep the `fetch` error handling pattern
   (`data.detail || "fallback"`) consistent.
+- Local uploads deliberately use `XMLHttpRequest` for upload progress; chunk creation,
+  retries, concurrency, cancellation, and finalization remain in `app.js`.
 - New UI text must be plain ASCII-safe where possible; existing emoji usage is fine.
 
 **Dockerfile**

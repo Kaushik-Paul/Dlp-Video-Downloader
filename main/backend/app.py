@@ -1,18 +1,22 @@
+import asyncio
 import base64
 import binascii
 import hashlib
 import hmac
 import json
 import logging
+import math
 import mimetypes
 import os
 import re
+import signal
 import shutil
 import subprocess
 import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
@@ -40,6 +44,8 @@ async def app_lifespan(_app: FastAPI):
     finally:
         cleanup_stop.set()
         cleanup_thread.join(timeout=2)
+        terminate_transfer_processes()
+        close_upload_sessions()
 
 
 app = FastAPI(title="YT-DLP Media Server", lifespan=app_lifespan)
@@ -53,6 +59,10 @@ APP_PASSWORD = os.getenv("APP_PASSWORD", "")
 SIGNING_SECRET = os.getenv("SIGNING_SECRET", APP_PASSWORD)
 LINK_TTL_HOURS = int(os.getenv("LINK_TTL_HOURS", "720"))
 MEDIA_RETENTION_DAYS = int(os.getenv("MEDIA_RETENTION_DAYS", "30"))
+UPLOAD_MAX_GIB = int(os.getenv("UPLOAD_MAX_GIB", "20"))
+UPLOAD_CHUNK_MIB = int(os.getenv("UPLOAD_CHUNK_MIB", "32"))
+UPLOAD_CONCURRENCY = int(os.getenv("UPLOAD_CONCURRENCY", "6"))
+DOWNLOAD_FRAGMENT_CONCURRENCY = int(os.getenv("DOWNLOAD_FRAGMENT_CONCURRENCY", "4"))
 SPACE_HOST = os.getenv("SPACE_HOST")
 YTDLP_PROXY = os.getenv("YTDLP_PROXY", "").strip()
 YOUTUBE_COOKIES_B64 = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
@@ -62,6 +72,14 @@ if LINK_TTL_HOURS <= 0:
     raise RuntimeError("LINK_TTL_HOURS must be greater than zero")
 if MEDIA_RETENTION_DAYS <= 0:
     raise RuntimeError("MEDIA_RETENTION_DAYS must be greater than zero")
+if UPLOAD_MAX_GIB <= 0:
+    raise RuntimeError("UPLOAD_MAX_GIB must be greater than zero")
+if not 5 <= UPLOAD_CHUNK_MIB <= 128:
+    raise RuntimeError("UPLOAD_CHUNK_MIB must be between 5 and 128")
+if not 1 <= UPLOAD_CONCURRENCY <= 12:
+    raise RuntimeError("UPLOAD_CONCURRENCY must be between 1 and 12")
+if not 1 <= DOWNLOAD_FRAGMENT_CONCURRENCY <= 8:
+    raise RuntimeError("DOWNLOAD_FRAGMENT_CONCURRENCY must be between 1 and 8")
 if YTDLP_PROXY and urlparse(YTDLP_PROXY).scheme not in {
     "http", "https", "socks4", "socks4a", "socks5", "socks5h"
 }:
@@ -84,11 +102,45 @@ VALID_MODES = {"best", "1080", "720", "audio", "mp3", "m4a"}
 VALID_DELIVERIES = {"stored", "instant"}
 JOB_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 CLEANUP_INTERVAL_SECONDS = 6 * 3600
+UPLOAD_SESSION_TTL_SECONDS = 6 * 3600
+UPLOAD_MAX_BYTES = UPLOAD_MAX_GIB * 1024**3
+UPLOAD_CHUNK_SIZE = UPLOAD_CHUNK_MIB * 1024**2
+UPLOAD_WRITE_BUFFER_SIZE = 4 * 1024**2
 
 # Only run one yt-dlp process at a time on CPU Basic hardware.
 download_semaphore = threading.Semaphore(1)
 jobs = {}
 jobs_lock = threading.Lock()
+transfer_processes: dict[str, subprocess.Popen] = {}
+transfer_processes_lock = threading.Lock()
+ACTIVE_TRANSFER_STATUSES = {"queued", "extracting", "downloading", "uploading"}
+
+
+class TransferCancelled(Exception):
+    pass
+
+
+@dataclass
+class UploadSession:
+    job_id: str
+    filename: str
+    path: Path
+    size: int
+    chunk_size: int
+    chunk_count: int
+    file_descriptor: int
+    created: int
+    completed_chunks: set[int] = field(default_factory=set)
+    active_chunks: set[int] = field(default_factory=set)
+    received_bytes: int = 0
+    last_activity: float = field(default_factory=time.monotonic)
+    cancelled: bool = False
+    finalizing: bool = False
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+upload_sessions: dict[str, UploadSession] = {}
+upload_sessions_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------
@@ -102,6 +154,12 @@ class CreateJobRequest(BaseModel):
 
 
 class PasswordRequest(BaseModel):
+    password: str
+
+
+class CreateUploadRequest(BaseModel):
+    filename: str
+    size: int
     password: str
 
 
@@ -141,11 +199,91 @@ def update_job(job_id: str, **values):
         jobs.setdefault(job_id, {}).update(values)
 
 
+def update_job_unless_cancelled(job_id: str, **values) -> bool:
+    with jobs_lock:
+        job = jobs.setdefault(job_id, {})
+        if job.get("status") == "cancelled":
+            return False
+        job.update(values)
+        return True
+
+
 def get_job(job_id: str):
     with jobs_lock:
         if job_id in jobs:
             return dict(jobs[job_id])
     return None
+
+
+def job_is_cancelled(job_id: str) -> bool:
+    with jobs_lock:
+        return jobs.get(job_id, {}).get("status") == "cancelled"
+
+
+def signal_transfer_process(process: subprocess.Popen, process_signal: int):
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, process_signal)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        logger.exception("Could not signal transfer process %s", process.pid)
+
+
+def terminate_transfer_processes(
+    processes: list[subprocess.Popen] | None = None,
+    timeout: float = 2.0,
+) -> int:
+    if processes is None:
+        with transfer_processes_lock:
+            processes = list(transfer_processes.values())
+    running = [process for process in processes if process.poll() is None]
+    for process in running:
+        signal_transfer_process(process, signal.SIGTERM)
+
+    deadline = time.monotonic() + timeout
+    while running and time.monotonic() < deadline:
+        running = [process for process in running if process.poll() is None]
+        if running:
+            time.sleep(0.05)
+    for process in running:
+        signal_transfer_process(process, signal.SIGKILL)
+    return len(processes)
+
+
+def run_transfer_process(
+    job_id: str,
+    command: list[str],
+    *,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess:
+    if job_is_cancelled(job_id):
+        raise TransferCancelled
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    with transfer_processes_lock:
+        transfer_processes[job_id] = process
+    if job_is_cancelled(job_id):
+        signal_transfer_process(process, signal.SIGTERM)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        terminate_transfer_processes([process])
+        process.communicate()
+        raise
+    finally:
+        with transfer_processes_lock:
+            if transfer_processes.get(job_id) is process:
+                transfer_processes.pop(job_id, None)
+    if job_is_cancelled(job_id):
+        raise TransferCancelled
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 def job_directory(job_id: str) -> Path:
@@ -155,6 +293,119 @@ def job_directory(job_id: str) -> Path:
 
 def metadata_path(job_id: str) -> Path:
     return job_directory(job_id) / "_meta.json"
+
+
+def upload_marker_path(job_id: str) -> Path:
+    return job_directory(job_id) / "_upload"
+
+
+def safe_upload_filename(filename: str) -> str:
+    name = filename.strip()
+    if (
+        not name
+        or name in {".", "..", "_meta.json"}
+        or Path(name).name != name
+        or "/" in name
+        or "\\" in name
+        or any(ord(character) < 32 for character in name)
+        or len(name.encode("utf-8")) > 240
+    ):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    return name
+
+
+def get_upload_session(job_id: str) -> UploadSession:
+    validate_job_id(job_id)
+    with upload_sessions_lock:
+        session = upload_sessions.get(job_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Upload session not found")
+    return session
+
+
+def close_file_descriptor(file_descriptor: int):
+    if file_descriptor < 0:
+        return
+    try:
+        os.close(file_descriptor)
+    except OSError:
+        pass
+
+
+def close_upload_file(session: UploadSession):
+    with session.lock:
+        file_descriptor = session.file_descriptor
+        session.file_descriptor = -1
+    close_file_descriptor(file_descriptor)
+
+
+def dispose_upload_session(session: UploadSession, *, remove_files: bool):
+    with upload_sessions_lock:
+        if upload_sessions.get(session.job_id) is session:
+            upload_sessions.pop(session.job_id, None)
+    close_upload_file(session)
+    if remove_files:
+        try:
+            shutil.rmtree(job_directory(session.job_id))
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.exception("Could not clean up upload session %s", session.job_id)
+
+
+def cancel_upload_session(job_id: str) -> bool:
+    with upload_sessions_lock:
+        session = upload_sessions.get(job_id)
+    if session is None:
+        return False
+    with session.lock:
+        session.cancelled = True
+        session.last_activity = time.monotonic()
+        idle = not session.active_chunks and not session.finalizing
+    if idle:
+        dispose_upload_session(session, remove_files=True)
+    return True
+
+
+def close_upload_sessions():
+    with upload_sessions_lock:
+        sessions = list(upload_sessions.values())
+        upload_sessions.clear()
+    for session in sessions:
+        with session.lock:
+            session.cancelled = True
+        close_upload_file(session)
+
+
+def cleanup_stale_uploads() -> int:
+    cutoff = time.monotonic() - UPLOAD_SESSION_TTL_SECONDS
+    with upload_sessions_lock:
+        sessions = list(upload_sessions.values())
+    stale = []
+    for session in sessions:
+        with session.lock:
+            if (
+                session.last_activity <= cutoff
+                and not session.active_chunks
+                and not session.finalizing
+            ):
+                session.cancelled = True
+                stale.append(session)
+    for session in stale:
+        dispose_upload_session(session, remove_files=True)
+        with jobs_lock:
+            jobs.pop(session.job_id, None)
+    return len(stale)
+
+
+def write_at(file_descriptor: int, data: bytes, offset: int):
+    view = memoryview(data)
+    written = 0
+    while written < len(view):
+        count = os.pwrite(file_descriptor, view[written:], offset + written)
+        if count <= 0:
+            raise OSError("Could not write upload chunk")
+        written += count
 
 
 def load_metadata(job_id: str):
@@ -196,8 +447,9 @@ def is_media_expired(job_id: str, metadata: dict, now: int | None = None) -> boo
 
 
 def remove_stored_job(job_id: str):
+    uploading = cancel_upload_session(job_id)
     directory = job_directory(job_id)
-    if directory.exists():
+    if directory.exists() and not uploading:
         shutil.rmtree(directory)
     with jobs_lock:
         jobs.pop(job_id, None)
@@ -215,6 +467,11 @@ def cleanup_expired_media(now: int | None = None) -> int:
         metadata = load_metadata(child.name)
         if metadata:
             expired = is_media_expired(child.name, metadata, current_time)
+        elif upload_marker_path(child.name).exists():
+            # Upload sessions cannot resume after a process restart. The marker
+            # lets startup cleanup remove their potentially huge partial files.
+            with upload_sessions_lock:
+                expired = child.name not in upload_sessions
         else:
             try:
                 expired = child.stat().st_mtime <= current_time - MEDIA_RETENTION_DAYS * 86400
@@ -237,6 +494,9 @@ def cleanup_loop(stop_event: threading.Event):
     while not stop_event.is_set():
         try:
             cleanup_expired_media()
+            removed_uploads = cleanup_stale_uploads()
+            if removed_uploads:
+                logger.info("Removed %d stale upload session(s)", removed_uploads)
         except Exception:
             logger.exception("Media retention cleanup failed")
         if stop_event.wait(CLEANUP_INTERVAL_SECONDS):
@@ -285,8 +545,12 @@ def public_base_url(request: Request) -> str:
             and parsed_host.username is None
             and parsed_host.password is None
         ):
-            forwarded_proto = request.headers.get("x-forwarded-proto", "https")
-            scheme = forwarded_proto.split(",")[-1].strip().lower()
+            forwarded_proto = request.headers.get("x-forwarded-proto")
+            scheme = (
+                forwarded_proto.split(",")[-1].strip().lower()
+                if forwarded_proto
+                else request.url.scheme.lower()
+            )
             if scheme not in {"http", "https"}:
                 scheme = "https"
             return f"{scheme}://{host}"
@@ -358,7 +622,7 @@ def selected_direct_formats(info: dict) -> list[dict]:
     return [info] if info.get("url") else []
 
 
-def yt_dlp_network_args() -> list[str]:
+def yt_dlp_network_args(*, download: bool = False) -> list[str]:
     arguments = [
         "--force-ipv4",
         "--impersonate",
@@ -366,6 +630,10 @@ def yt_dlp_network_args() -> list[str]:
         "--extractor-args",
         "youtube:player_client=mweb",
     ]
+    if download:
+        arguments.extend(
+            ("--concurrent-fragments", str(DOWNLOAD_FRAGMENT_CONCURRENCY))
+        )
     if YTDLP_PROXY:
         arguments.extend(("--proxy", YTDLP_PROXY))
     if YOUTUBE_COOKIES_B64:
@@ -390,7 +658,12 @@ def yt_dlp_error(stderr: str, fallback: str) -> str:
 
 def run_instant_link(job_id: str, url: str, mode: str):
     try:
-        update_job(job_id, status="extracting", message="Extracting source links...")
+        if not update_job_unless_cancelled(
+            job_id,
+            status="extracting",
+            message="Extracting source links...",
+        ):
+            raise TransferCancelled
         command = [
             "yt-dlp",
             "--no-playlist",
@@ -403,13 +676,7 @@ def run_instant_link(job_id: str, url: str, mode: str):
             instant_format_selector(mode),
             url,
         ]
-        result = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=120,
-        )
+        result = run_transfer_process(job_id, command, timeout=120)
         if result.returncode != 0:
             raise RuntimeError(
                 yt_dlp_error(result.stderr, "yt-dlp could not extract a source link")
@@ -450,7 +717,7 @@ def run_instant_link(job_id: str, url: str, mode: str):
         filename = info.get("_filename") or f"{title}.{extension}"
         headers_required = any(bool(item.get("http_headers")) for item in formats)
 
-        update_job(
+        update_job_unless_cancelled(
             job_id,
             status="ready",
             message="Source links ready",
@@ -466,10 +733,16 @@ def run_instant_link(job_id: str, url: str, mode: str):
             source_expires=direct_link_expiration(urls),
             provider_headers_required=headers_required,
         )
+    except TransferCancelled:
+        pass
     except subprocess.TimeoutExpired:
-        update_job(job_id, status="error", message="Source link extraction timed out")
+        update_job_unless_cancelled(
+            job_id,
+            status="error",
+            message="Source link extraction timed out",
+        )
     except Exception as exc:
-        update_job(job_id, status="error", message=str(exc))
+        update_job_unless_cancelled(job_id, status="error", message=str(exc))
 
 
 # ---------------------------------------------------------------------
@@ -478,14 +751,21 @@ def run_instant_link(job_id: str, url: str, mode: str):
 def run_download(job_id: str, url: str, mode: str):
     directory = job_directory(job_id)
     try:
+        if job_is_cancelled(job_id):
+            raise TransferCancelled
         with download_semaphore:
-            update_job(job_id, status="downloading", message="Downloading media...")
+            if not update_job_unless_cancelled(
+                job_id,
+                status="downloading",
+                message="Downloading media...",
+            ):
+                raise TransferCancelled
             directory.mkdir(parents=True, exist_ok=True)
 
             command = [
                 "yt-dlp",
                 "--no-playlist",
-                *yt_dlp_network_args(),
+                *yt_dlp_network_args(download=True),
                 "--no-progress",
                 "-P", str(directory),
                 "-o", "%(title).180B [%(id)s].%(ext)s",
@@ -508,7 +788,7 @@ def run_download(job_id: str, url: str, mode: str):
 
             command.append(url)
 
-            result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            result = run_transfer_process(job_id, command)
 
             if result.returncode != 0:
                 raise RuntimeError(yt_dlp_error(result.stderr, "yt-dlp failed"))
@@ -540,20 +820,324 @@ def run_download(job_id: str, url: str, mode: str):
                 encoding="utf-8",
             )
 
-            update_job(job_id, status="ready", message="Ready", filename=media_file.name, size=metadata["size"])
+            if not update_job_unless_cancelled(
+                job_id,
+                status="ready",
+                message="Ready",
+                filename=media_file.name,
+                size=metadata["size"],
+            ):
+                raise TransferCancelled
 
+    except TransferCancelled:
+        if directory.exists():
+            try:
+                shutil.rmtree(directory)
+            except OSError:
+                logger.exception("Could not clean up cancelled media job %s", job_id)
     except Exception as exc:
         if directory.exists() and not metadata_path(job_id).exists():
             try:
                 shutil.rmtree(directory)
             except OSError:
                 logger.exception("Could not clean up failed media job %s", job_id)
-        update_job(job_id, status="error", message=str(exc))
+        update_job_unless_cancelled(job_id, status="error", message=str(exc))
 
 
 # ---------------------------------------------------------------------
 # API
 # ---------------------------------------------------------------------
+@app.post("/api/transfers/cancel")
+def cancel_all_transfers():
+    with jobs_lock:
+        cancelled_job_ids = [
+            job_id
+            for job_id, job in jobs.items()
+            if job.get("status") in ACTIVE_TRANSFER_STATUSES
+        ]
+        for job_id in cancelled_job_ids:
+            jobs[job_id].update(
+                status="cancelled",
+                message="Cancelled by user",
+            )
+
+    with upload_sessions_lock:
+        upload_job_ids = list(upload_sessions)
+    cancelled_uploads = sum(
+        1 for job_id in upload_job_ids if cancel_upload_session(job_id)
+    )
+
+    with transfer_processes_lock:
+        processes = list(transfer_processes.values())
+    terminated_processes = terminate_transfer_processes(processes)
+    return {
+        "ok": True,
+        "cancelled_jobs": len(cancelled_job_ids),
+        "cancelled_uploads": cancelled_uploads,
+        "terminated_processes": terminated_processes,
+    }
+
+
+@app.post("/api/uploads")
+def create_upload(body: CreateUploadRequest):
+    verify_password(body.password)
+    filename = safe_upload_filename(body.filename)
+    if body.size <= 0:
+        raise HTTPException(status_code=400, detail="The file is empty")
+    if body.size > UPLOAD_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Files are limited to {UPLOAD_MAX_GIB} GiB",
+        )
+
+    cleanup_stale_uploads()
+    with upload_sessions_lock:
+        if len(upload_sessions) >= 4:
+            raise HTTPException(
+                status_code=503,
+                detail="Too many uploads are already in progress",
+            )
+
+    job_id = uuid.uuid4().hex
+    directory = job_directory(job_id)
+    path = directory / filename
+    file_descriptor = None
+    try:
+        directory.mkdir(parents=True, exist_ok=False)
+        file_descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except OSError as exc:
+        if file_descriptor is not None:
+            close_file_descriptor(file_descriptor)
+        try:
+            shutil.rmtree(directory)
+        except OSError:
+            pass
+        logger.exception("Could not create upload session %s", job_id)
+        raise HTTPException(status_code=500, detail="Could not create upload") from exc
+
+    created = int(time.time())
+    chunk_count = math.ceil(body.size / UPLOAD_CHUNK_SIZE)
+    session = UploadSession(
+        job_id=job_id,
+        filename=filename,
+        path=path,
+        size=body.size,
+        chunk_size=UPLOAD_CHUNK_SIZE,
+        chunk_count=chunk_count,
+        file_descriptor=file_descriptor,
+        created=created,
+    )
+    try:
+        with upload_sessions_lock:
+            upload_marker_path(job_id).touch(exist_ok=False)
+            upload_sessions[job_id] = session
+    except OSError as exc:
+        close_file_descriptor(file_descriptor)
+        try:
+            shutil.rmtree(directory)
+        except OSError:
+            pass
+        logger.exception("Could not persist upload session %s", job_id)
+        raise HTTPException(status_code=500, detail="Could not create upload") from exc
+    update_job(
+        job_id,
+        status="uploading",
+        message="Uploading file...",
+        filename=filename,
+        size=body.size,
+        uploaded=0,
+        mode="upload",
+        delivery="stored",
+        created=created,
+    )
+    return {
+        "job_id": job_id,
+        "status": "uploading",
+        "chunk_size": UPLOAD_CHUNK_SIZE,
+        "chunk_count": chunk_count,
+        "concurrency": min(UPLOAD_CONCURRENCY, chunk_count),
+    }
+
+
+@app.put("/api/uploads/{job_id}/chunks/{chunk_index}")
+async def upload_chunk(job_id: str, chunk_index: int, request: Request):
+    verify_password(request.headers.get("x-app-password", ""))
+    session = get_upload_session(job_id)
+    if chunk_index < 0 or chunk_index >= session.chunk_count:
+        raise HTTPException(status_code=400, detail="Invalid upload chunk")
+
+    offset = chunk_index * session.chunk_size
+    expected_size = min(session.chunk_size, session.size - offset)
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            declared_size = int(content_length)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length") from exc
+        if declared_size != expected_size:
+            raise HTTPException(status_code=400, detail="Upload chunk has the wrong size")
+
+    with session.lock:
+        if session.cancelled or session.finalizing:
+            raise HTTPException(status_code=409, detail="Upload was cancelled")
+        if chunk_index in session.completed_chunks:
+            return {"ok": True, "chunk": chunk_index, "already_uploaded": True}
+        if chunk_index in session.active_chunks:
+            raise HTTPException(status_code=409, detail="Upload chunk is already in progress")
+        session.active_chunks.add(chunk_index)
+        session.last_activity = time.monotonic()
+
+    received = 0
+    buffer = bytearray()
+    completed = False
+    try:
+        async for block in request.stream():
+            if not block:
+                continue
+            with session.lock:
+                if session.cancelled:
+                    raise HTTPException(status_code=409, detail="Upload was cancelled")
+            if received + len(buffer) + len(block) > expected_size:
+                raise HTTPException(status_code=400, detail="Upload chunk is too large")
+            buffer.extend(block)
+            if len(buffer) >= UPLOAD_WRITE_BUFFER_SIZE:
+                payload = bytes(buffer)
+                buffer.clear()
+                await asyncio.to_thread(
+                    write_at,
+                    session.file_descriptor,
+                    payload,
+                    offset + received,
+                )
+                received += len(payload)
+        if buffer:
+            payload = bytes(buffer)
+            await asyncio.to_thread(
+                write_at,
+                session.file_descriptor,
+                payload,
+                offset + received,
+            )
+            received += len(payload)
+        if received != expected_size:
+            raise HTTPException(status_code=400, detail="Upload chunk is incomplete")
+
+        with session.lock:
+            if session.cancelled:
+                raise HTTPException(status_code=409, detail="Upload was cancelled")
+            session.completed_chunks.add(chunk_index)
+            session.received_bytes += expected_size
+            session.last_activity = time.monotonic()
+            uploaded = session.received_bytes
+            completed = True
+        update_job_unless_cancelled(
+            job_id,
+            uploaded=uploaded,
+            message=f"Uploading file... {uploaded * 100 // session.size}%",
+        )
+        return {"ok": True, "chunk": chunk_index, "uploaded": uploaded}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Could not write chunk %d for upload %s", chunk_index, job_id)
+        raise HTTPException(status_code=500, detail="Could not write upload chunk") from exc
+    finally:
+        with session.lock:
+            session.active_chunks.discard(chunk_index)
+            if not completed:
+                session.last_activity = time.monotonic()
+            dispose = (
+                session.cancelled
+                and not session.active_chunks
+                and not session.finalizing
+            )
+        if dispose:
+            dispose_upload_session(session, remove_files=True)
+
+
+@app.post("/api/uploads/{job_id}/complete")
+async def complete_upload(job_id: str, body: PasswordRequest, request: Request):
+    verify_password(body.password)
+    session = get_upload_session(job_id)
+    with session.lock:
+        if session.cancelled:
+            raise HTTPException(status_code=409, detail="Upload was cancelled")
+        if session.finalizing:
+            raise HTTPException(status_code=409, detail="Upload is already finalizing")
+        if session.active_chunks:
+            raise HTTPException(status_code=409, detail="Upload chunks are still in progress")
+        if len(session.completed_chunks) != session.chunk_count:
+            missing = session.chunk_count - len(session.completed_chunks)
+            raise HTTPException(status_code=409, detail=f"{missing} upload chunk(s) are missing")
+        session.finalizing = True
+        file_descriptor = session.file_descriptor
+
+    try:
+        await asyncio.to_thread(os.fsync, file_descriptor)
+        with session.lock:
+            if session.cancelled:
+                raise TransferCancelled
+        if session.path.stat().st_size != session.size:
+            raise OSError("Uploaded file size does not match")
+
+        created = int(time.time())
+        metadata = {
+            "job_id": job_id,
+            "filename": session.filename,
+            "size": session.size,
+            "mode": "upload",
+            "created": created,
+            "retention_expires": created + MEDIA_RETENTION_DAYS * 86400,
+        }
+        metadata_path(job_id).write_text(
+            json.dumps(metadata, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        upload_marker_path(job_id).unlink(missing_ok=True)
+        if not update_job_unless_cancelled(
+            job_id,
+            status="ready",
+            message="Ready",
+            filename=session.filename,
+            size=session.size,
+            uploaded=session.size,
+            retention_expires=metadata["retention_expires"],
+        ):
+            raise TransferCancelled
+    except TransferCancelled as exc:
+        with session.lock:
+            session.finalizing = False
+        dispose_upload_session(session, remove_files=True)
+        raise HTTPException(status_code=409, detail="Upload was cancelled") from exc
+    except Exception as exc:
+        logger.exception("Could not finalize upload %s", job_id)
+        update_job_unless_cancelled(
+            job_id,
+            status="error",
+            message="Could not finalize upload",
+        )
+        with session.lock:
+            session.finalizing = False
+        dispose_upload_session(session, remove_files=True)
+        raise HTTPException(status_code=500, detail="Could not finalize upload") from exc
+
+    with session.lock:
+        session.finalizing = False
+    dispose_upload_session(session, remove_files=False)
+    job = get_job(job_id) or {}
+    return {"job_id": job_id, **job, **create_media_links(job_id, request)}
+
+
+@app.post("/api/uploads/{job_id}/abort")
+def abort_upload(job_id: str, body: PasswordRequest):
+    verify_password(body.password)
+    validate_job_id(job_id)
+    cancelled = cancel_upload_session(job_id)
+    with jobs_lock:
+        jobs.pop(job_id, None)
+    return {"ok": True, "cancelled": cancelled}
+
+
 @app.post("/api/jobs")
 def create_job(body: CreateJobRequest):
     verify_password(body.password)
@@ -664,7 +1248,7 @@ def library(body: PasswordRequest, request: Request):
 # ---------------------------------------------------------------------
 # Range-enabled streaming
 # ---------------------------------------------------------------------
-def file_iterator(path: Path, start: int, end: int, chunk_size: int = 1024 * 1024):
+def file_iterator(path: Path, start: int, end: int, chunk_size: int = 8 * 1024 * 1024):
     with path.open("rb") as file:
         file.seek(start)
         remaining = end - start + 1
@@ -686,7 +1270,9 @@ def serve_media(job_id: str, request: Request, expires: int, sig: str, download:
     encoded_filename = quote(path.name)
     headers = {
         "Accept-Ranges": "bytes",
+        "Cache-Control": "private, no-transform",
         "Content-Disposition": f"{disposition}; filename*=UTF-8''{encoded_filename}",
+        "X-Content-Type-Options": "nosniff",
     }
 
     range_header = request.headers.get("range")
